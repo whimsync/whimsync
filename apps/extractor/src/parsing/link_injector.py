@@ -5,39 +5,64 @@ from typing import Any
 import pymupdf
 
 
+def _link_target(link: dict[str, Any]) -> str | None:
+    kind = link.get("kind")
+    if kind == pymupdf.LINK_URI:
+        return link.get("uri")
+    if kind == pymupdf.LINK_GOTO:
+        dest_page = link.get("page", -1)
+        return f"#page-{dest_page + 1}" if dest_page >= 0 else None
+    if kind == pymupdf.LINK_GOTOR:
+        return link.get("file") or link.get("uri")
+    return None
+
+
 def _extract_page_links(page: pymupdf.Page) -> list[dict[str, Any]]:
-    """Extracts {text, uri, rect} for actionable links on the page."""
-    links = []
+    """
+    Extracts {text, uri, rect} for actionable links on the page.
+
+    PDF producers often split one hyperlink into several annotations (one per
+    word, per inter-word space, or per wrapped line). Fragments with the same
+    target whose words are adjacent in reading order are merged back into a
+    single link, so "PostgreSQL documentation" stays one anchor.
+    """
+    # Words in reading order: (x0, y0, x1, y1, text, block, line, word).
+    words = sorted(page.get_text("words"), key=lambda w: (w[5], w[6], w[7]))
+
+    fragments = []
     for link in page.get_links():
-        rect = pymupdf.Rect(link["from"])
-        kind = link.get("kind")
-        target = None
-
-        if kind == pymupdf.LINK_URI:
-            target = link.get("uri")
-        elif kind == pymupdf.LINK_GOTO:
-            dest_page = link.get("page", -1)
-            if dest_page >= 0:
-                target = f"#page-{dest_page + 1}"
-        elif kind == pymupdf.LINK_GOTOR:
-            target = link.get("file") or link.get("uri")
-
+        target = _link_target(link)
         if not target:
             continue
 
-        words = page.get_text("words")
-        hits = []
-        for w in words:
+        rect = pymupdf.Rect(link["from"])
+        hit_indices = []
+        for idx, w in enumerate(words):
             wrect = pymupdf.Rect(w[:4])
             inter = wrect & rect
             if wrect.get_area() > 0 and inter.get_area() > 0.2 * wrect.get_area():
-                hits.append(w)
+                hit_indices.append(idx)
 
-        hits.sort(key=lambda w: (w[5], w[6], w[7]))
-        text = re.sub(r"\s+", " ", " ".join(w[4] for w in hits)).strip()
+        if hit_indices:
+            fragments.append({"uri": target, "rect": rect, "indices": hit_indices})
 
+    fragments.sort(key=lambda f: f["indices"][0])
+
+    merged: list[dict[str, Any]] = []
+    for frag in fragments:
+        prev = merged[-1] if merged else None
+        # Adjacent (or overlapping) words with the same target belong to one link.
+        if prev and prev["uri"] == frag["uri"] and frag["indices"][0] <= prev["indices"][-1] + 1:
+            prev["indices"] = sorted(set(prev["indices"]) | set(frag["indices"]))
+            prev["rect"] = prev["rect"] | frag["rect"]
+        else:
+            merged.append({**frag, "indices": list(frag["indices"])})
+
+    links = []
+    for item in merged:
+        text = re.sub(r"\s+", " ", " ".join(words[i][4] for i in item["indices"])).strip()
         if text:
-            links.append({"text": text, "uri": target, "rect": rect})
+            links.append({"text": text, "uri": item["uri"], "rect": item["rect"]})
 
     links.sort(key=lambda item: (round(item["rect"].y0, 1), item["rect"].x0))
     return links
